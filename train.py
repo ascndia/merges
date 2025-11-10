@@ -22,7 +22,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from sit import SiT_models
 from loss import SILoss
 
-from dataset import LMDBLatentsDataset
+from dataset import CustomDataset
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 import math
 
@@ -111,14 +111,14 @@ def main(args):
     
     # Define block_kwargs from args
     block_kwargs = {
-        "fused_attn": False,
+        "attn_func": args.attn_func,
         "qk_norm": False,
     }
 
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        use_cfg = (args.cfg_prob > 0),
+        use_cfg = (args.cfg_omega > 0),
         **block_kwargs
     )
 
@@ -128,19 +128,11 @@ def main(args):
     
     # Create loss function with all MeanFlow parameters
     loss_fn = SILoss(
-        path_type=args.path_type, 
-        # Add MeanFlow specific parameters
-        time_sampler=args.time_sampler,
-        time_mu=args.time_mu,
-        time_sigma=args.time_sigma,
-        ratio_r_not_equal_t=args.ratio_r_not_equal_t,
-        adaptive_p=args.adaptive_p,
-        weighting=args.weighting,
-        label_dropout_prob=args.cfg_prob,
+        rate_same=args.rate_same,
+        p_mean=args.p_mean,
+        p_std=args.p_std,
         cfg_omega=args.cfg_omega,
-        cfg_kappa=args.cfg_kappa,
-        cfg_min_t=args.cfg_min_t,
-        cfg_max_t=args.cfg_max_t
+        adaptive_p=args.adaptive_p
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -159,7 +151,7 @@ def main(args):
     )    
     
     # Setup data:
-    train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
+    train_dataset = CustomDataset(args.data_dir)
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -211,7 +203,7 @@ def main(args):
         ).view(1, 4, 1, 1).to(device)
     for epoch in range(args.epochs):
         model.train()
-        for moments, labels in train_dataloader:
+        for _, moments, labels in train_dataloader:
             moments = moments.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
@@ -219,6 +211,8 @@ def main(args):
                 posterior = DiagonalGaussianDistribution(moments)
                 x = posterior.sample()
                 x = x * latents_scale + latents_bias
+                B = x.shape[0]
+                x = x.view(B, 4, -1).transpose(1, 2)  
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -320,23 +314,14 @@ def parse_args(input_args=None):
 
     # cpu
     parser.add_argument("--num-workers", type=int, default=4)
-
-    # basic loss
-    parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
-    parser.add_argument("--cfg-prob", type=float, default=0.1)
-    parser.add_argument("--weighting", default="adaptive", type=str, choices=["uniform", "adaptive"], help="Loss weighting type")
     
     # MeanFlow specific parameters
-    parser.add_argument("--time-sampler", type=str, default="logit_normal", choices=["uniform", "logit_normal"], 
-                       help="Time sampling strategy")
-    parser.add_argument("--time-mu", type=float, default=-0.4, help="Mean parameter for logit_normal distribution")
-    parser.add_argument("--time-sigma", type=float, default=1.0, help="Std parameter for logit_normal distribution")
-    parser.add_argument("--ratio-r-not-equal-t", type=float, default=0.75, help="Ratio of samples where r≠t")
+    parser.add_argument("--attn-func", type=str, default="base", choices=["base", "torch_sdpa", "fa2", "fa3"])
+    parser.add_argument("--p-mean", type=float, default=-0.4, help="Mean of p distribution")
+    parser.add_argument("--p-std", type=float, default=1.0, help="Std of p distribution")
     parser.add_argument("--adaptive-p", type=float, default=1.0, help="Power param for adaptive weighting")
     parser.add_argument("--cfg-omega", type=float, default=1.0, help="CFG omega param, default 1.0 means no CFG")
-    parser.add_argument("--cfg-kappa", type=float, default=0.0, help="CFG kappa param for mixing")
-    parser.add_argument("--cfg-min-t", type=float, default=0.0, help="Minum time for cfg trigger")
-    parser.add_argument("--cfg-max-t", type=float, default=1.0, help="Maxium time for cfg trigger")
+    parser.add_argument("--rate-same", type=float, default=0.25, help="Rate of samples with r=t")
     
     if input_args is not None:
         args = parser.parse_args(input_args)

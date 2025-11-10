@@ -1,48 +1,245 @@
-import torch
-import lmdb
-import pickle
-import numpy as np
-import os
+# from typing import Tuple, Any
+# import torch
+# from torchvision.datasets import ImageFolder, DatasetFolder
 
-class LMDBLatentsDataset(torch.utils.data.Dataset):
-    """    
-    Args:
-        lmdb_path (str): LMDB dataset path.
-        flip_prob (float): flip or upflip.
-    """
-    def __init__(self, lmdb_path, flip_prob=0.5):
-        self.env = lmdb.open(lmdb_path,
-                           readonly=True,
-                           lock=False,
-                           readahead=False,
-                           meminit=False)
+# class EncodedDatasetWithRawImage(DatasetFolder):
+#     """
+#     Dataset for loading data pre-encoded by the encode.py script.
+    
+#     Each .pt file contains a tuple: (normalized_image_tensor, latent_params_tensor)
+#     """
+#     def __getitem__(self, index: int) -> Tuple[Any, Any, Any]:
+#         # self.samples[index] provides (path, target)
+#         path, target = self.samples[index]
         
-        with self.env.begin() as txn:
-            self.length = int(txn.get('num_samples'.encode()).decode())
-        self.flip_prob = flip_prob
-    
-    def __len__(self):
-        return self.length
-    
-    def __getitem__(self, index):
-        with self.env.begin() as txn:
-            data = txn.get(f'{index}'.encode())
-            if data is None:
-                raise IndexError(f'Index {index} is out of bounds')
-            
-            data = pickle.loads(data)
-            moments = data['moments']
-            moments_flip = data['moments_flip']
-            label = data['label']
-            
-            use_flip = torch.rand(1).item() < self.flip_prob
-            
-            moments_to_use = moments_flip if use_flip else moments
-            
-            moments_tensor = torch.from_numpy(moments_to_use).float()
-            
-            return moments_tensor, label
-    
-    def __del__(self):
-        self.env.close()
+#         # 1. Load the tuple saved by encode.py
+#         #    raw_image is the normalized tensor, e.g., (3, 256, 256)
+#         #    latent_params is (2, 4, 32, 32) [stack of mean and std]
+#         raw_image, latent_params = torch.load(path)
+        
+#         # 2. Get mean and std from the latent parameters
+#         mean, std = latent_params[0], latent_params[1]
+        
+#         # 3. Sample from the distribution to get the vae_features (the latent z)
+#         #    This is your original logic.
+#         vae_features = (mean + std * torch.randn_like(std)).mul_(0.18215)
 
+#         if self.target_transform is not None:
+#             target = self.target_transform(target)
+            
+#         # 4. Return all three items as requested
+#         return raw_image, vae_features, target
+
+#     def __init__(self, root, **kwargs):
+#         # Initialize the DatasetFolder to look for .pt files
+#         super().__init__(
+#             root,
+#             loader=lambda x: x,  # The loader does nothing, __getitem__ handles it
+#             extensions=(".pt",),
+#             **kwargs
+#         )
+
+# class EncodedDataset(DatasetFolder):
+#     def __getitem__(self, index: int) -> Tuple[Any, Any]:
+#         path, target = self.samples[index]
+#         sample = torch.load(path)
+#         sample = (sample[0] + sample[1] * torch.randn_like(sample[1])).mul_(0.18215)
+#         if self.target_transform is not None:
+#             target = self.target_transform(target)
+#         return sample, target
+
+import os
+import json
+import random
+import glob
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+
+from PIL import Image
+import PIL.Image
+try:
+    import pyspng
+except ImportError:
+    pyspng = None
+
+
+class CustomDataset(Dataset):
+    def __init__(self, data_dir):
+        PIL.Image.init()
+        supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
+
+        self.images_dir = os.path.join(data_dir, 'images')
+        self.features_dir = os.path.join(data_dir, 'vae-sd')
+
+        # images
+        self._image_fnames = {
+            os.path.relpath(os.path.join(root, fname), start=self.images_dir)
+            for root, _dirs, files in os.walk(self.images_dir) for fname in files
+            }
+        self.image_fnames = sorted(
+            fname for fname in self._image_fnames if self._file_ext(fname) in supported_ext
+            )
+        # features
+        self._feature_fnames = {
+            os.path.relpath(os.path.join(root, fname), start=self.features_dir)
+            for root, _dirs, files in os.walk(self.features_dir) for fname in files
+            }
+        self.feature_fnames = sorted(
+            fname for fname in self._feature_fnames if self._file_ext(fname) in supported_ext
+            )
+        # labels
+        fname = 'dataset.json'
+        with open(os.path.join(self.features_dir, fname), 'rb') as f:
+            labels = json.load(f)['labels']
+        labels = dict(labels)
+        labels = [labels[fname.replace('\\', '/')] for fname in self.feature_fnames]
+        labels = np.array(labels)
+        self.labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+
+
+    def _file_ext(self, fname):
+        return os.path.splitext(fname)[1].lower()
+
+    def __len__(self):
+        assert len(self.image_fnames) == len(self.feature_fnames), \
+            "Number of feature files and label files should be same"
+        return len(self.feature_fnames)
+
+    def __getitem__(self, idx):
+        image_fname = self.image_fnames[idx]
+        feature_fname = self.feature_fnames[idx]
+        image_ext = self._file_ext(image_fname)
+        with open(os.path.join(self.images_dir, image_fname), 'rb') as f:
+            if image_ext == '.npy':
+                image = np.load(f)
+                image = image.reshape(-1, *image.shape[-2:])
+            elif image_ext == '.png' and pyspng is not None:
+                image = pyspng.load(f.read())
+                image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
+            else:
+                image = np.array(PIL.Image.open(f))
+                image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
+
+        features = np.load(os.path.join(self.features_dir, feature_fname))
+        return torch.from_numpy(image), torch.from_numpy(features), torch.tensor(self.labels[idx])
+
+def get_feature_dir_info(root):
+    files = glob.glob(os.path.join(root, '*.npy'))
+    files_caption = glob.glob(os.path.join(root, '*_*.npy'))
+    num_data = len(files) - len(files_caption)
+    n_captions = {k: 0 for k in range(num_data)}
+    for f in files_caption:
+        name = os.path.split(f)[-1]
+        k1, k2 = os.path.splitext(name)[0].split('_')
+        n_captions[int(k1)] += 1
+    return num_data, n_captions
+
+
+class DatasetFactory(object):
+
+    def __init__(self):
+        self.train = None
+        self.test = None
+
+    def get_split(self, split, labeled=False):
+        if split == "train":
+            dataset = self.train
+        elif split == "test":
+            dataset = self.test
+        else:
+            raise ValueError
+
+        if self.has_label:
+            return dataset #if labeled else UnlabeledDataset(dataset)
+        else:
+            assert not labeled
+            return dataset
+
+    def unpreprocess(self, v):  # to B C H W and [0, 1]
+        v = 0.5 * (v + 1.)
+        v.clamp_(0., 1.)
+        return v
+
+    @property
+    def has_label(self):
+        return True
+
+    @property
+    def data_shape(self):
+        raise NotImplementedError
+
+    @property
+    def data_dim(self):
+        return int(np.prod(self.data_shape))
+
+    @property
+    def fid_stat(self):
+        return None
+
+    def sample_label(self, n_samples, device):
+        raise NotImplementedError
+
+    def label_prob(self, k):
+        raise NotImplementedError
+
+class MSCOCOFeatureDataset(Dataset):
+    # the image features are got through sample
+    def __init__(self, root):
+        self.root = root
+        self.num_data, self.n_captions = get_feature_dir_info(root)
+
+    def __len__(self):
+        return self.num_data
+
+    def __getitem__(self, index):
+        with open(os.path.join(self.root, f'{index}.png'), 'rb') as f:
+            x = np.array(PIL.Image.open(f))
+            x = x.reshape(*x.shape[:2], -1).transpose(2, 0, 1)
+
+        z = np.load(os.path.join(self.root, f'{index}.npy'))
+        k = random.randint(0, self.n_captions[index] - 1)
+        c = np.load(os.path.join(self.root, f'{index}_{k}.npy'))
+        return x, z, c
+
+
+class CFGDataset(Dataset):  # for classifier free guidance
+    def __init__(self, dataset, p_uncond, empty_token):
+        self.dataset = dataset
+        self.p_uncond = p_uncond
+        self.empty_token = empty_token
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, item):
+        x, z, y = self.dataset[item]
+        if random.random() < self.p_uncond:
+            y = self.empty_token
+        return x, z, y
+
+class MSCOCO256Features(DatasetFactory):  # the moments calculated by Stable Diffusion image encoder & the contexts calculated by clip
+    def __init__(self, path, cfg=True, p_uncond=0.1, mode='train'):
+        super().__init__()
+        print('Prepare dataset...')
+        if mode == 'val':
+            self.test = MSCOCOFeatureDataset(os.path.join(path, 'val'))
+            assert len(self.test) == 40504
+            self.empty_context = np.load(os.path.join(path, 'empty_context.npy'))
+        else:
+            self.train = MSCOCOFeatureDataset(os.path.join(path, 'train'))
+            assert len(self.train) == 82783
+            self.empty_context = np.load(os.path.join(path, 'empty_context.npy'))
+
+            if cfg:  # classifier free guidance
+                assert p_uncond is not None
+                print(f'prepare the dataset for classifier free guidance with p_uncond={p_uncond}')
+                self.train = CFGDataset(self.train, p_uncond, self.empty_context)
+
+    @property
+    def data_shape(self):
+        return 4, 32, 32
+
+    @property
+    def fid_stat(self):
+        return f'assets/fid_stats/fid_stats_mscoco256_val.npz'

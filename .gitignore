@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+exps/
+logs/
+results/
+*.log
+*.ckpt
