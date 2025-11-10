@@ -5,3 +5,4 @@ logs/
 results/
 *.log
 *.ckpt
+hf_cache/

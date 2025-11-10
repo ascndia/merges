@@ -24,7 +24,9 @@ from sit import SiT_models
 from loss import SILoss
 
 from dataset import CustomDataset
+from diffusers.models import AutoencoderKL
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from train_handlers import SampleHandler, MeanFlowSampler, CheckpointHandler
 import math
 
 logger = get_logger(__name__)
@@ -92,6 +94,8 @@ def main(args):
             json.dump(args_dict, f, indent=4)
         checkpoint_dir = f"{save_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
+        sample_dir = f"{save_dir}/samples"  # Stores sampled outputs
+        os.makedirs(sample_dir, exist_ok=True)
         logger = create_logger(save_dir)
         logger.info(f"Experiment directory created at {save_dir}")
         
@@ -105,6 +109,8 @@ def main(args):
         accelerator.native_amp = False    
     if args.seed is not None:
         set_seed(args.seed + accelerator.process_index)
+    
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
     
     # Create model:
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -182,6 +188,10 @@ def main(args):
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
     
+    # Create sampler and sample handler
+    sampler = MeanFlowSampler(batch_size=32, num_classes=args.num_classes, latent_size=latent_size, cfg_scale=1.0)
+    sample_handler = SampleHandler(sample_dir=sample_dir, model=ema, sampler=sampler, vae=vae, interval=args.sample_interval, nfe_list=[1, 4])
+    
     # resume:
     global_step = 0
     if args.resume_step > 0:
@@ -198,6 +208,10 @@ def main(args):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+    
+    # Create checkpoint handler after prepare to access model.module
+    unwrapped_model = model.module if hasattr(model, 'module') else model
+    checkpoint_handler = CheckpointHandler(checkpoint_dir, unwrapped_model, optimizer, ema, args, args.checkpointing_steps)
         
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -223,8 +237,6 @@ def main(args):
                 posterior = DiagonalGaussianDistribution(moments)
                 x = posterior.sample()
                 x = x * latents_scale + latents_bias
-                # B = x.shape[0]
-                # x = x.view(B, 4, -1).transpose(1, 2)  
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -247,19 +259,10 @@ def main(args):
             
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                global_step += 1                
-            if global_step % args.checkpointing_steps == 0 and global_step > 0 or global_step >= args.max_train_steps:
+                global_step += 1
                 if accelerator.is_main_process:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": optimizer.state_dict(),
-                        "args": args,
-                        "steps": global_step,
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    sample_handler.handle(global_step)
+                    checkpoint_handler.handle(global_step)
             
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(), 
@@ -268,9 +271,9 @@ def main(args):
             }
             progress_bar.set_postfix(**logs)
             
-            # Log to file periodically
-            if accelerator.is_main_process and global_step % 100 == 0:
-                logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
+            # # Log to file periodically
+            # if accelerator.is_main_process and global_step % 100 == 0:
+            #     logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
 
             if global_step >= args.max_train_steps:
                 break
@@ -284,6 +287,7 @@ def main(args):
     
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        checkpoint_handler.save_final(global_step)
         logger.info("Training completed!")
     accelerator.end_training()
 
@@ -313,6 +317,7 @@ def parse_args(input_args=None):
     parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--checkpointing-steps", type=int, default=50000)
+    parser.add_argument("--sample-interval", type=int, default=1000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
