@@ -8,3 +8,4 @@ lmdb
 Pillow
 -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity
 accelerate
+bitsandbytes

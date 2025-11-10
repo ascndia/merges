@@ -8,11 +8,18 @@ set -euo pipefail
 # - Rewrites --data-dir or --data-path provided as host paths to /workspace/data
 # - Runs `python -u train.py` inside the container as the invoking host UID
 
+REBUILD=false
+for arg in "$@"; do
+  if [ "$arg" = "--rebuild" ]; then
+    REBUILD=true
+    break
+  fi
+done
 # image tag to build/use
 IMAGE=${IMAGE:-meanflow:local}
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1 || [ "$REBUILD" = true ]; then
   echo "Docker image $IMAGE not found. Building image from $ROOT..."
   docker build -t "$IMAGE" "$ROOT"
 fi
@@ -80,7 +87,7 @@ done
 
 USER_ARG=("--user" "$(id -u):$(id -g)")
 
-docker run --gpus=all -it --rm "${USER_ARG[@]}" \
+docker run --gpus=all -it  --rm "${USER_ARG[@]}" \
   -v "$ROOT":/workspace \
   -v "$RESULTS_DIR":/workspace/results \
   -v "$DATA_DIR":/workspace/data \

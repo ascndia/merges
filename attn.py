@@ -26,8 +26,8 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
     
 """Modulation operation for adaptive layer norm zero (adaLN-Zero)"""
-def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-    return x * (1 + scale) + shift
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 """RMS Layer Normalization"""
@@ -146,6 +146,6 @@ class SiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x

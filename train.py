@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import OrderedDict
 import json
 
+import bitsandbytes
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -142,7 +143,7 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    optimizer = torch.optim.Adam(
+    optimizer = bitsandbytes.optim.Adam8bit(
         model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
@@ -211,8 +212,8 @@ def main(args):
                 posterior = DiagonalGaussianDistribution(moments)
                 x = posterior.sample()
                 x = x * latents_scale + latents_bias
-                B = x.shape[0]
-                x = x.view(B, 4, -1).transpose(1, 2)  
+                # B = x.shape[0]
+                # x = x.view(B, 4, -1).transpose(1, 2)  
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -220,13 +221,13 @@ def main(args):
                 loss_mean = loss.mean()
                 loss_mean_ref = loss_ref.mean()
                 loss = loss_mean                
-                    
+        
                 ## optimization
                 accelerator.backward(loss)
-                grad_norm = 0.0
+                grad_norm = torch.tensor(0.0, device=device)  # Initialize as tensor
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
-                    grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    grad_norm = torch.tensor(accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm), device=device)  # Convert to tensor
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -252,7 +253,7 @@ def main(args):
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(), 
                 "loss_ref": accelerator.gather(loss_mean_ref).mean().detach().item(), 
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
+                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()  # Now works since grad_norm is a tensor
             }
             progress_bar.set_postfix(**logs)
             
