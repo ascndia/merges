@@ -112,7 +112,7 @@ def main(args):
     
     # Define block_kwargs from args
     block_kwargs = {
-        "attn_func": args.attn_func,
+        "fused_attn": True,
         "qk_norm": False,
     }
 
@@ -129,11 +129,22 @@ def main(args):
     
     # Create loss function with all MeanFlow parameters
     loss_fn = SILoss(
-        rate_same=args.rate_same,
-        p_mean=args.p_mean,
-        p_std=args.p_std,
+        path_type=args.path_type,
+        weighting=args.weighting,
+        # New parameters
+        time_sampler=args.time_sampler,
+        time_mu=args.time_mu,
+        time_sigma=args.time_sigma,
+        ratio_r_not_equal_t=args.ratio_r_not_equal_t,
+        adaptive_p=args.adaptive_p,
+        label_dropout_prob=args.label_dropout_prob,
+        # CFG related params
         cfg_omega=args.cfg_omega,
-        adaptive_p=args.adaptive_p
+        cfg_kappa=args.cfg_kappa,
+        cfg_min_t=args.cfg_min_t,
+        cfg_max_t=args.cfg_max_t,
+        # CHANGED: Added DDE epsilon
+        differential_epsilon=args.differential_epsilon,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -286,7 +297,7 @@ def parse_args(input_args=None):
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
-    parser.add_argument("--model", type=str, default="SiT-XL/2")
+    parser.add_argument("--model", type=str, default="SiT-B/2")
     parser.add_argument("--num-classes", type=int, default=1000)
 
     # dataset
@@ -314,15 +325,22 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=0)
 
     # cpu
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=6)
     
     # MeanFlow specific parameters
-    parser.add_argument("--attn-func", type=str, default="base", choices=["base", "torch_sdpa", "fa2", "fa3"])
-    parser.add_argument("--p-mean", type=float, default=-0.4, help="Mean of p distribution")
-    parser.add_argument("--p-std", type=float, default=1.0, help="Std of p distribution")
-    parser.add_argument("--adaptive-p", type=float, default=1.0, help="Power param for adaptive weighting")
-    parser.add_argument("--cfg-omega", type=float, default=1.0, help="CFG omega param, default 1.0 means no CFG")
-    parser.add_argument("--rate-same", type=float, default=0.25, help="Rate of samples with r=t")
+    parser.add_argument("--path-type", type=str, default="linear", choices=["cosine", "linear"])
+    parser.add_argument("--weighting", type=str, default="adaptive", choices=["adaptive", "uniform"])
+    parser.add_argument("--time-sampler", type=str, default="logit_normal", choices=["uniform", "logit_normal"])
+    parser.add_argument("--time-mu", type=float, default=-0.4)
+    parser.add_argument("--time-sigma", type=float, default=1.0)
+    parser.add_argument("--ratio-r-not-equal-t", type=float, default=0.75)
+    parser.add_argument("--adaptive-p", type=float, default=1.0)
+    parser.add_argument("--label-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--cfg-omega", type=float, default=1.0)
+    parser.add_argument("--cfg-kappa", type=float, default=0.0)
+    parser.add_argument("--cfg-min-t", type=float, default=0.0)
+    parser.add_argument("--cfg-max-t", type=float, default=0.8)
+    parser.add_argument("--differential-epsilon", type=float, default=0.005) 
     
     if input_args is not None:
         args = parser.parse_args(input_args)

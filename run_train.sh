@@ -87,7 +87,7 @@ done
 
 USER_ARG=("--user" "$(id -u):$(id -g)")
 
-docker run --gpus=all -it  --rm "${USER_ARG[@]}" \
+docker run --gpus=all -it --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --rm "${USER_ARG[@]}" \
   -v "$ROOT":/workspace \
   -v "$RESULTS_DIR":/workspace/results \
   -v "$DATA_DIR":/workspace/data \
