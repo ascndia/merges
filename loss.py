@@ -256,15 +256,15 @@ class SILoss:
                     num_classes = model.num_classes
 
                 cfg_z_t_batch = torch.cat([cfg_z_t, cfg_z_t], dim=0)
-                cfg_t_batch = torch.cat([cfg_t, cfg_t], dim=0)
-                cfg_t_end_batch = torch.cat([cfg_t, cfg_t], dim=0)
+                cfg_r_batch = torch.cat([cfg_r, cfg_r], dim=0) 
+                cfg_t_batch = torch.cat([cfg_t, cfg_t], dim=0) 
                 cfg_y_batch = torch.cat([cfg_y, torch.full_like(cfg_y, num_classes)], dim=0)
-                
+
                 cfg_combined_kwargs = cfg_kwargs.copy()
                 cfg_combined_kwargs['y'] = cfg_y_batch
-                
+
                 with torch.no_grad():
-                    cfg_combined_u_at_t = model(cfg_z_t_batch, cfg_t_batch, cfg_t_end_batch, **cfg_combined_kwargs)
+                    cfg_combined_u_at_t = model(cfg_z_t_batch, cfg_r_batch, cfg_t_batch, **cfg_combined_kwargs)
                     cfg_u_cond_at_t, cfg_u_uncond_at_t = torch.chunk(cfg_combined_u_at_t, 2, dim=0)
                     cfg_v_tilde = (self.cfg_omega * cfg_v_t + 
                                    self.cfg_kappa * cfg_u_cond_at_t + 
