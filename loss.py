@@ -119,6 +119,7 @@ class SILoss:
     #     dudt = (f_plus - f_minus) / (2 * epsilon)
         
     #     return dudt
+    
     @torch.no_grad()
     def _dde_derivative(self, model, x, z, t, r, model_kwargs, rng_state=None):
         """
@@ -169,15 +170,14 @@ class SILoss:
             rng_state = torch.cuda.get_rng_state()
 
         torch.cuda.set_rng_state(rng_state)
-        f_plus = model(x_plus, t_plus, r, **kwargs_plus)
+        f_plus = model(x_plus, r, t_plus, **kwargs_plus)
 
         torch.cuda.set_rng_state(rng_state)
-        f_minus = model(x_minus, t_minus, r, **kwargs_minus)
+        f_minus = model(x_minus, r, t_minus, **kwargs_minus)
 
         dF_dv_dt = (f_plus - f_minus) / (2 * eps)
         return dF_dv_dt
 
-    
     def __call__(self, model, images, model_kwargs=None):
         """
         Compute MeanFlow loss function with bootstrap mechanism

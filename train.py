@@ -322,7 +322,7 @@ def parse_args(input_args=None):
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam-beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam-weight-decay", type=float, default=0., help="Weight decay to use.")
+    parser.add_argument("--adam-weight-decay", type=float, default=0.01, help="Weight decay to use.") # https://www.arxiv.org/abs/2511.03202v2
     parser.add_argument("--adam-epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
 
