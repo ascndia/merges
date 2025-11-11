@@ -87,38 +87,95 @@ class SILoss:
         
         return r, t 
     
-    # CHANGED: Added DDE helper method
+    # # CHANGED: Added DDE helper method
+    # @torch.no_grad()
+    # def _dde_derivative(self, model, z_t, r, t, v_t, model_kwargs):
+    #     """
+    #     Compute the DDE approximation of the JVP: (du/dz_t * v_t + du/dt * 1)
+    #     using central difference.
+    #     """
+    #     epsilon = self.differential_epsilon
+        
+    #     # f(x + eps * v)
+    #     # x = (z_t, r, t), v = (v_t, 0, 1)
+    #     # x + eps * v = (z_t + eps * v_t, r, t + eps)
+    #     f_plus = model(
+    #         z_t + epsilon * v_t, 
+    #         r, 
+    #         t + epsilon, 
+    #         **model_kwargs
+    #     )
+        
+    #     # f(x - eps * v)
+    #     # x - eps * v = (z_t - eps * v_t, r, t - eps)
+    #     f_minus = model(
+    #         z_t - epsilon * v_t, 
+    #         r, 
+    #         t - epsilon, 
+    #         **model_kwargs
+    #     )
+        
+    #     # Central difference: (f_plus - f_minus) / (2 * epsilon)
+    #     dudt = (f_plus - f_minus) / (2 * epsilon)
+        
+    #     return dudt
     @torch.no_grad()
-    def _dde_derivative(self, model, z_t, r, t, v_t, model_kwargs):
+    def _dde_derivative(self, model, x, z, t, r, model_kwargs, rng_state=None):
         """
-        Compute the DDE approximation of the JVP: (du/dz_t * v_t + du/dt * 1)
-        using central difference.
+        Differential Derivation Equation (DDE) approximation for df/dt
+        Equivalent to TransitionSchedule.dde_derivative from TiM.
+        Args:
+            model: neural network f_θ(x_t, t, r, ...)
+            x: clean input (B, C, H, W)
+            z: noise sample (B, C, H, W)
+            t: timestep tensor (B,)
+            r: reference timestep tensor (B,)
+            model_kwargs: dict for model inputs (copied before in-place)
+            rng_state: RNG state to ensure determinism
+        Returns:
+            dF_dv_dt: tensor of shape (B, C, H, W)
         """
-        epsilon = self.differential_epsilon
-        
-        # f(x + eps * v)
-        # x = (z_t, r, t), v = (v_t, 0, 1)
-        # x + eps * v = (z_t + eps * v_t, r, t + eps)
-        f_plus = model(
-            z_t + epsilon * v_t, 
-            r, 
-            t + epsilon, 
-            **model_kwargs
-        )
-        
-        # f(x - eps * v)
-        # x - eps * v = (z_t - eps * v_t, r, t - eps)
-        f_minus = model(
-            z_t - epsilon * v_t, 
-            r, 
-            t - epsilon, 
-            **model_kwargs
-        )
-        
-        # Central difference: (f_plus - f_minus) / (2 * epsilon)
-        dudt = (f_plus - f_minus) / (2 * epsilon)
-        
-        return dudt
+        eps = self.differential_epsilon
+        B = x.size(0)
+
+        # ensure device and dtype consistency
+        device, dtype = x.device, x.dtype
+        t = t.view(-1).to(device=device, dtype=dtype)
+        r = r.view(-1).to(device=device, dtype=dtype)
+
+        # compute t±ε and corresponding interpolants
+        t_plus = (t + eps).clamp(0.0, 1.0)
+        t_minus = (t - eps).clamp(0.0, 1.0)
+
+        alpha_plus, sigma_plus, _, _ = self.interpolant(t_plus.view(-1, 1, 1, 1))
+        alpha_minus, sigma_minus, _, _ = self.interpolant(t_minus.view(-1, 1, 1, 1))
+
+        # x_{t±ε} = α * x + σ * z
+        x_plus = alpha_plus * x + sigma_plus * z
+        x_minus = alpha_minus * x + sigma_minus * z
+
+        # make deep copies of kwargs
+        kwargs_plus, kwargs_minus = {}, {}
+        for k, v in model_kwargs.items():
+            if torch.is_tensor(v) and v.shape[0] == B:
+                kwargs_plus[k] = v.clone()
+                kwargs_minus[k] = v.clone()
+            else:
+                kwargs_plus[k] = v
+                kwargs_minus[k] = v
+
+        # preserve RNG determinism
+        if rng_state is None:
+            rng_state = torch.cuda.get_rng_state()
+
+        torch.cuda.set_rng_state(rng_state)
+        f_plus = model(x_plus, t_plus, r, **kwargs_plus)
+
+        torch.cuda.set_rng_state(rng_state)
+        f_minus = model(x_minus, t_minus, r, **kwargs_minus)
+
+        dF_dv_dt = (f_plus - f_minus) / (2 * eps)
+        return dF_dv_dt
 
     
     def __call__(self, model, images, model_kwargs=None):
@@ -132,7 +189,7 @@ class SILoss:
 
         batch_size = images.shape[0]
         device = images.device
-
+        rng_state = torch.cuda.get_rng_state()
         unconditional_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
         if model_kwargs.get('y') is not None and self.label_dropout_prob > 0:
@@ -215,12 +272,13 @@ class SILoss:
                 
                 # CHANGED: Compute JVP with CFG velocity using DDE
                 cfg_dudt = self._dde_derivative(
-                    model, 
-                    cfg_z_t, 
-                    cfg_r, 
-                    cfg_t, 
-                    cfg_v_tilde, # Use guided velocity
-                    cfg_kwargs
+                    model,
+                    images[cfg_indices],   # x (clean)
+                    noises[cfg_indices],   # z (noise)
+                    cfg_t,                 # t
+                    cfg_r,                 # r
+                    cfg_kwargs,
+                    rng_state=rng_state
                 )
                 
                 cfg_u_target = cfg_v_tilde - cfg_time_diff * cfg_dudt
@@ -244,12 +302,14 @@ class SILoss:
                 # CHANGED: Compute JVP for non-CFG samples using DDE
                 no_cfg_dudt = self._dde_derivative(
                     model,
-                    no_cfg_z_t,
-                    no_cfg_r,
+                    images[no_cfg_indices],
+                    noises[no_cfg_indices],
                     no_cfg_t,
-                    no_cfg_v_t, # Use standard velocity
-                    no_cfg_kwargs
+                    no_cfg_r,
+                    no_cfg_kwargs,
+                    rng_state=rng_state
                 )
+
                 
                 no_cfg_u_target = no_cfg_v_t - no_cfg_time_diff * no_cfg_dudt
                 u_target[no_cfg_indices] = no_cfg_u_target
@@ -259,12 +319,14 @@ class SILoss:
             # CHANGED: Compute JVP for all samples using DDE
             dudt = self._dde_derivative(
                 model,
-                z_t,
-                r,
-                t,
-                v_t, # Use standard velocity
-                model_kwargs
+                images,    # x (clean)
+                noises,    # z (noise)
+                t,         # t
+                r,         # r
+                model_kwargs,
+                rng_state=rng_state
             )
+
             
             u_target = v_t - time_diff * dudt
                 
