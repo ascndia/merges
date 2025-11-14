@@ -73,7 +73,7 @@ class MeanFlowSampler:
         return samples
 
 class SampleHandler(AbstractHandler):
-    def __init__(self, sample_dir, model, sampler, vae, interval, nfe_list=None):
+    def __init__(self, sample_dir, model, sampler,  vae=None, interval = 1000, nfe_list=None):
         super().__init__()
         self.sample_dir = sample_dir
         self.model = model
@@ -84,14 +84,21 @@ class SampleHandler(AbstractHandler):
         self.latents_scale = torch.tensor([0.18125, 0.18125, 0.18125, 0.18125]).view(1, 4, 1, 1).to(next(model.parameters()).device)
         self.latents_bias = torch.tensor([0., 0., 0., 0.]).view(1, 4, 1, 1).to(next(model.parameters()).device)
     
+    @torch.no_grad()
+    def decode(self, latents):
+        decoded = self.vae.decode((latents - self.latents_bias) / self.latents_scale).sample
+        decoded = (decoded + 1) / 2
+        decoded = torch.clamp(decoded, 0, 1)
+        return decoded
+    
     def handle(self, step):
         if step % self.interval == 0 or step == 1:
             for nfe in self.nfe_list:
                 samples = self.sampler.sample(self.model, nfe)
-                with torch.no_grad():
-                    decoded = self.vae.decode((samples - self.latents_bias) / self.latents_scale).sample
-                    decoded = (decoded + 1) / 2
-                    decoded = torch.clamp(decoded, 0, 1)
+                if self.vae is not None:
+                    decoded = self.decode(samples)
+                else:
+                    decoded = samples
                 grid = make_grid(decoded, nrow=4, normalize=False)  # assuming batch_size=32, 4x8 grid
                 grid = grid.permute(1, 2, 0).cpu().numpy()
                 grid = (grid * 255).astype('uint8')

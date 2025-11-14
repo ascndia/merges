@@ -85,7 +85,7 @@ def main(args):
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        save_dir = os.path.join(args.output_dir, args.exp_name)
+        save_dir = os.path.join(args.output_dir, f"{args.exp_name}-batch-size{args.batch_size * args.gradient_accumulation_steps}")
         os.makedirs(save_dir, exist_ok=True)
         args_dict = vars(args)
         # Save to a JSON file
@@ -110,11 +110,17 @@ def main(args):
     if args.seed is not None:
         set_seed(args.seed + accelerator.process_index)
     
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
+    if args.dataset == "custom":
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
+    elif args.dataset == "mnist":
+        vae = None
     
     # Create model:
-    assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.resolution // 8
+    if vae is not None:
+        assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+        input_size = args.resolution // 8
+    else:
+        input_size = args.resolution  # For MNIST, no VAE, so latent size = image size
     
     # Define block_kwargs from args
     block_kwargs = {
@@ -123,7 +129,7 @@ def main(args):
     }
 
     model = SiT_models[args.model](
-        input_size=latent_size,
+        input_size=input_size,
         num_classes=args.num_classes,
         use_cfg = (args.cfg_omega > 0),
         **block_kwargs
@@ -169,7 +175,12 @@ def main(args):
     )    
     
     # Setup data:
-    train_dataset = CustomDataset(args.data_dir)
+    if args.dataset == "custom":
+        train_dataset = CustomDataset(args.data_dir)
+    elif args.dataset == "mnist":
+        # train_dataset = MNISTDataset(args.data_dir)
+        raise NotImplementedError("MNIST dataset loading not implemented yet.")
+
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -189,7 +200,7 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
     
     # Create sampler and sample handler
-    sampler = MeanFlowSampler(batch_size=32, num_classes=args.num_classes, latent_size=latent_size, cfg_scale=1.0)
+    sampler = MeanFlowSampler(batch_size=32, num_classes=args.num_classes, latent_size=input_size, cfg_scale=1.0)
     sample_handler = SampleHandler(sample_dir=sample_dir, model=ema, sampler=sampler, vae=vae, interval=args.sample_interval, nfe_list=[1, 4])
     
     # resume:
@@ -296,7 +307,7 @@ def parse_args(input_args=None):
 
     # logging:
     parser.add_argument("--output-dir", type=str, default="exps")
-    parser.add_argument("--exp-name", type=str, required=True)
+    parser.add_argument("--exp-name", type=str, default="meanflow_experiment")
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--resume-step", type=int, default=0)
 
@@ -305,6 +316,7 @@ def parse_args(input_args=None):
     parser.add_argument("--num-classes", type=int, default=1000)
 
     # dataset
+    parser.add_argument("--dataset", type=str, choices=["custom", "mnist"], default="custom")
     parser.add_argument("--data-dir", type=str, default="/data/train_sdvae_latents_lmdb")
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--batch-size", type=int, default=256)
