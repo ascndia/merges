@@ -212,10 +212,23 @@ def main(args):
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
     
+    if not hasattr(args, 'cls_token_dim'):
+         # Atur default jika tidak ada, misal 768 untuk DINOv2-B
+        args.cls_token_dim = 768 
+    if not hasattr(args, 'cls_cfg_scale'):
+        args.cls_cfg_scale = 1.0 # Default
+
     # Create sampler and sample handler
-    sampler = MeanFlowSampler(batch_size=32, num_classes=args.num_classes, latent_size=input_size, cfg_scale=1.0)
+    sampler = MeanFlowSampler(
+        batch_size=32, 
+        num_classes=args.num_classes, 
+        latent_size=input_size, 
+        cls_token_dim=args.cls_token_dim, # <-- BARU
+        cfg_scale=1.0, 
+        cls_cfg_scale=args.cls_cfg_scale  # <-- BARU
+    )    
     sample_handler = SampleHandler(sample_dir=sample_dir, model=ema, sampler=sampler, vae=vae, interval=args.sample_interval, nfe_list=[1, 4])
-    
+
     # resume:
     global_step = 0
     if args.resume_step > 0:
@@ -408,7 +421,8 @@ def parse_args(input_args=None):
     parser.add_argument("--enc-type", type=str, default='dinov2-vit-b') # REPA
     parser.add_argument("--proj-coeff", type=float, default=0.5) # REPA
     parser.add_argument("--cls", type=float, default=0.03) # REG
-    
+    parser.add_argument("--cls-token-dim", type=int, default=768) # REG
+    parser.add_argument("--cls-cfg-scale", type=float, default=1.0) # REG
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:

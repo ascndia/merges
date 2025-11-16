@@ -73,27 +73,61 @@ class CheckpointHandler(AbstractHandler):
         checkpoint_path = f"{self.checkpoint_dir}/checkpoint_final.pt"
         torch.save(checkpoint, checkpoint_path)
 
+# class MeanFlowSampler:
+#     def __init__(self, batch_size, num_classes, latent_size, cfg_scale=1.0):
+#         self.batch_size = batch_size
+#         self.num_classes = num_classes
+#         self.latent_size = latent_size
+#         self.cfg_scale = cfg_scale
+    
+#     @torch.no_grad()
+#     def sample(self, model, num_steps):
+#         device = next(model.parameters()).device
+#         z = torch.randn(self.batch_size, model.in_channels, self.latent_size, self.latent_size, device=device)
+#         y = torch.randint(0, self.num_classes, (self.batch_size,), device=device)
+#         samples = meanflow_sampler(
+#             model=model,
+#             latents=z,
+#             y=y,
+#             cfg_scale=self.cfg_scale,
+#             num_steps=num_steps
+#         )
+#         return samples
+
+
 class MeanFlowSampler:
-    def __init__(self, batch_size, num_classes, latent_size, cfg_scale=1.0):
+    def __init__(self, batch_size, num_classes, latent_size, cls_token_dim, cfg_scale=1.0, cls_cfg_scale=1.0):
         self.batch_size = batch_size
         self.num_classes = num_classes
         self.latent_size = latent_size
+        self.cls_token_dim = cls_token_dim  # <-- BARU
         self.cfg_scale = cfg_scale
+        self.cls_cfg_scale = cls_cfg_scale  # <-- BARU
     
     @torch.no_grad()
     def sample(self, model, num_steps):
         device = next(model.parameters()).device
-        z = torch.randn(self.batch_size, model.in_channels, self.latent_size, self.latent_size, device=device)
+        _dtype = next(model.parameters()).dtype # <-- Tambahan: untuk konsistensi tipe data
+        
+        # Noise untuk gambar
+        z = torch.randn(self.batch_size, model.in_channels, self.latent_size, self.latent_size, device=device, dtype=_dtype)
+        # Label
         y = torch.randint(0, self.num_classes, (self.batch_size,), device=device)
+        
+        # <-- BARU: Noise untuk class token
+        z_cls = torch.randn(self.batch_size, self.cls_token_dim, device=device, dtype=_dtype)
+        
         samples = meanflow_sampler(
             model=model,
             latents=z,
+            cls_latents=z_cls,          # <-- BARU: Teruskan noise token
             y=y,
             cfg_scale=self.cfg_scale,
+            cls_cfg_scale=self.cls_cfg_scale, # <-- BARU: Teruskan skala CFG token
             num_steps=num_steps
         )
         return samples
-
+    
 class SampleHandler(AbstractHandler):
     def __init__(self, sample_dir, model, sampler,  vae=None, interval = 1000, nfe_list=None):
         super().__init__()
