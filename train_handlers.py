@@ -22,10 +22,21 @@ class CheckpointHandler(AbstractHandler):
     
     def handle(self, step):
         if step % self.interval == 0 and step > 0 or step >= self.args.max_train_steps or step == 1:
+            def _move_to_cpu(obj):
+                if isinstance(obj, dict):
+                    return {k: _move_to_cpu(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_move_to_cpu(v) for v in obj]
+                if isinstance(obj, tuple):
+                    return tuple(_move_to_cpu(v) for v in obj)
+                if isinstance(obj, torch.Tensor):
+                    return obj.cpu()
+                return obj
+
             checkpoint = {
-                "model": self.model.state_dict(),
-                "ema": self.ema.state_dict(),
-                "opt": self.optimizer.state_dict(),
+                "model": _move_to_cpu(self.model.state_dict()),
+                "ema": _move_to_cpu(self.ema.state_dict()),
+                "opt": _move_to_cpu(self.optimizer.state_dict()),
                 "args": self.args,
                 "steps": step,
             }
@@ -41,10 +52,21 @@ class CheckpointHandler(AbstractHandler):
                     pass
 
     def save_final(self, step):
+        def _move_to_cpu(obj):
+            if isinstance(obj, dict):
+                return {k: _move_to_cpu(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_move_to_cpu(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_move_to_cpu(v) for v in obj)
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu()
+            return obj
+
         checkpoint = {
-            "model": self.model.state_dict(),
-            "ema": self.ema.state_dict(),
-            "opt": self.optimizer.state_dict(),
+            "model": _move_to_cpu(self.model.state_dict()),
+            "ema": _move_to_cpu(self.ema.state_dict()),
+            "opt": _move_to_cpu(self.optimizer.state_dict()),
             "args": self.args,
             "steps": step,
         }
@@ -95,13 +117,30 @@ class SampleHandler(AbstractHandler):
         if step % self.interval == 0 or step == 1:
             for nfe in self.nfe_list:
                 samples = self.sampler.sample(self.model, nfe)
+                # move samples to CPU as soon as possible to free GPU memory
+                try:
+                    samples = samples.detach().cpu()
+                except Exception:
+                    samples = samples.detach()
+
                 if self.vae is not None:
-                    decoded = self.decode(samples)
+                    # decode on VAE device if needed, then move decoded result to CPU
+                    vae_device = next(self.vae.parameters()).device
+                    decoded = self.decode(samples.to(vae_device))
+                    decoded = decoded.detach().cpu()
                 else:
                     decoded = samples
-                grid = make_grid(decoded, nrow=4, normalize=False)  # assuming batch_size=32, 4x8 grid
-                grid = grid.permute(1, 2, 0).cpu().numpy()
+
+                grid = make_grid(decoded, nrow=4, normalize=False)
+                grid = grid.permute(1, 2, 0).numpy()
                 grid = (grid * 255).astype('uint8')
                 img = Image.fromarray(grid)
                 sample_path = f"{self.sample_dir}/samples_{step}_nfe_{nfe}.png"
                 img.save(sample_path)
+
+                # free any lingering GPU cache
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
