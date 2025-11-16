@@ -140,6 +140,8 @@ def main(args):
         input_size=input_size,
         num_classes=args.num_classes,
         use_cfg = (args.cfg_omega > 0),
+        z_dims = z_dims,
+        encoder_depth=args.encoder_depth,
         **block_kwargs
     )
 
@@ -165,6 +167,8 @@ def main(args):
         cfg_max_t=args.cfg_max_t,
         # CHANGED: Added DDE epsilon
         differential_epsilon=args.differential_epsilon,
+        # CHANGED: Encoders
+        encoders=encoders,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
