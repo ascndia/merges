@@ -82,10 +82,12 @@ def main(args):
         mixed_precision=args.mixed_precision,
         project_config=accelerator_project_config,
     )
+    
+    save_dir = os.path.join(args.output_dir, f"{args.exp_name}-batch-size{args.batch_size * args.gradient_accumulation_steps}")
+    sample_dir = f"{save_dir}/samples"  # Stores sampled outputs
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        save_dir = os.path.join(args.output_dir, f"{args.exp_name}-batch-size{args.batch_size * args.gradient_accumulation_steps}")
         os.makedirs(save_dir, exist_ok=True)
         args_dict = vars(args)
         # Save to a JSON file
@@ -94,7 +96,6 @@ def main(args):
             json.dump(args_dict, f, indent=4)
         checkpoint_dir = f"{save_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        sample_dir = f"{save_dir}/samples"  # Stores sampled outputs
         os.makedirs(sample_dir, exist_ok=True)
         logger = create_logger(save_dir)
         logger.info(f"Experiment directory created at {save_dir}")
