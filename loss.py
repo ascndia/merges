@@ -1,6 +1,19 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 # from torch.func import jvp  # REMOVED
+
+def mean_flat(x):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
+
+def sum_flat(x):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return torch.sum(x, dim=list(range(1, len(x.size()))))
 
 class SILoss:
     def __init__(
@@ -22,6 +35,8 @@ class SILoss:
             
             # CHANGED: Added DDE epsilon
             differential_epsilon=0.005,
+            # REPA & REG
+            encoders=[]
             ):
         self.weighting = weighting
         self.path_type = path_type
@@ -43,6 +58,8 @@ class SILoss:
 
         # CHANGED: Added DDE epsilon
         self.differential_epsilon = differential_epsilon
+
+        self.encoders = encoders
         
 
     def interpolant(self, t):
@@ -87,75 +104,101 @@ class SILoss:
         
         return r, t 
     
-    # # CHANGED: Added DDE helper method
     # @torch.no_grad()
-    # def _dde_derivative(self, model, z_t, r, t, v_t, model_kwargs):
+    # def _dde_derivative(self, model, x, z, t, r, model_kwargs, rng_state=None):
     #     """
-    #     Compute the DDE approximation of the JVP: (du/dz_t * v_t + du/dt * 1)
-    #     using central difference.
+    #     Differential Derivation Equation (DDE) approximation for df/dt
+    #     Equivalent to TransitionSchedule.dde_derivative from TiM.
+    #     Args:
+    #         model: neural network f_θ(x_t, t, r, ...)
+    #         x: clean input (B, C, H, W)
+    #         z: noise sample (B, C, H, W)
+    #         t: timestep tensor (B,)
+    #         r: reference timestep tensor (B,)
+    #         model_kwargs: dict for model inputs (copied before in-place)
+    #         rng_state: RNG state to ensure determinism
+    #     Returns:
+    #         dF_dv_dt: tensor of shape (B, C, H, W)
     #     """
-    #     epsilon = self.differential_epsilon
-        
-    #     # f(x + eps * v)
-    #     # x = (z_t, r, t), v = (v_t, 0, 1)
-    #     # x + eps * v = (z_t + eps * v_t, r, t + eps)
-    #     f_plus = model(
-    #         z_t + epsilon * v_t, 
-    #         r, 
-    #         t + epsilon, 
-    #         **model_kwargs
-    #     )
-        
-    #     # f(x - eps * v)
-    #     # x - eps * v = (z_t - eps * v_t, r, t - eps)
-    #     f_minus = model(
-    #         z_t - epsilon * v_t, 
-    #         r, 
-    #         t - epsilon, 
-    #         **model_kwargs
-    #     )
-        
-    #     # Central difference: (f_plus - f_minus) / (2 * epsilon)
-    #     dudt = (f_plus - f_minus) / (2 * epsilon)
-        
-    #     return dudt
-    
-    @torch.no_grad()
-    def _dde_derivative(self, model, x, z, t, r, model_kwargs, rng_state=None):
+    #     eps = self.differential_epsilon
+    #     B = x.size(0)
+
+    #     # ensure device and dtype consistency
+    #     device, dtype = x.device, x.dtype
+    #     t = t.view(-1).to(device=device, dtype=dtype)
+    #     r = r.view(-1).to(device=device, dtype=dtype)
+
+    #     # compute t±ε and corresponding interpolants
+    #     t_plus = (t + eps).clamp(0.0, 1.0)
+    #     t_minus = (t - eps).clamp(0.0, 1.0)
+
+    #     alpha_plus, sigma_plus, _, _ = self.interpolant(t_plus.view(-1, 1, 1, 1))
+    #     alpha_minus, sigma_minus, _, _ = self.interpolant(t_minus.view(-1, 1, 1, 1))
+
+    #     # x_{t±ε} = α * x + σ * z
+    #     x_plus = alpha_plus * x + sigma_plus * z
+    #     x_minus = alpha_minus * x + sigma_minus * z
+
+    #     # make deep copies of kwargs
+    #     kwargs_plus, kwargs_minus = {}, {}
+    #     for k, v in model_kwargs.items():
+    #         if torch.is_tensor(v) and v.shape[0] == B:
+    #             kwargs_plus[k] = v.clone()
+    #             kwargs_minus[k] = v.clone()
+    #         else:
+    #             kwargs_plus[k] = v
+    #             kwargs_minus[k] = v
+
+    #     # preserve RNG determinism
+    #     if rng_state is None:
+    #         rng_state = torch.cuda.get_rng_state()
+
+    #     torch.cuda.set_rng_state(rng_state)
+    #     f_plus = model(x_plus, r, t_plus, **kwargs_plus)
+
+    #     torch.cuda.set_rng_state(rng_state)
+    #     f_minus = model(x_minus, r, t_minus, **kwargs_minus)
+
+    #     dF_dv_dt = (f_plus - f_minus) / (2 * eps)
+    #     return dF_dv_dt
+
+
+    @torch.no_grad() # by gemini
+    def _dde_derivative(self, model, x, z, t, r, model_kwargs, 
+                        cls_token, noises_cls, # <-- MODIFIED: Added token inputs
+                        rng_state=None):
         """
         Differential Derivation Equation (DDE) approximation for df/dt
-        Equivalent to TransitionSchedule.dde_derivative from TiM.
-        Args:
-            model: neural network f_θ(x_t, t, r, ...)
-            x: clean input (B, C, H, W)
-            z: noise sample (B, C, H, W)
-            t: timestep tensor (B,)
-            r: reference timestep tensor (B,)
-            model_kwargs: dict for model inputs (copied before in-place)
-            rng_state: RNG state to ensure determinism
-        Returns:
-            dF_dv_dt: tensor of shape (B, C, H, W)
         """
         eps = self.differential_epsilon
         B = x.size(0)
 
-        # ensure device and dtype consistency
         device, dtype = x.device, x.dtype
         t = t.view(-1).to(device=device, dtype=dtype)
         r = r.view(-1).to(device=device, dtype=dtype)
 
-        # compute t±ε and corresponding interpolants
         t_plus = (t + eps).clamp(0.0, 1.0)
         t_minus = (t - eps).clamp(0.0, 1.0)
 
         alpha_plus, sigma_plus, _, _ = self.interpolant(t_plus.view(-1, 1, 1, 1))
         alpha_minus, sigma_minus, _, _ = self.interpolant(t_minus.view(-1, 1, 1, 1))
 
-        # x_{t±ε} = α * x + σ * z
         x_plus = alpha_plus * x + sigma_plus * z
         x_minus = alpha_minus * x + sigma_minus * z
+        
+        # <-- MODIFIED: Calculate noisy cls_token for t+eps and t-eps
+        cls_input_plus = None
+        cls_input_minus = None
+        if cls_token is not None:
+            alpha_plus_cls = alpha_plus.squeeze().unsqueeze(-1)
+            sigma_plus_cls = sigma_plus.squeeze().unsqueeze(-1)
+            alpha_minus_cls = alpha_minus.squeeze().unsqueeze(-1)
+            sigma_minus_cls = sigma_minus.squeeze().unsqueeze(-1)
+            
+            cls_input_plus = alpha_plus_cls * cls_token + sigma_plus_cls * noises_cls
+            cls_input_minus = alpha_minus_cls * cls_token + sigma_minus_cls * noises_cls
+        # --- End Modification ---
 
-        # make deep copies of kwargs
         kwargs_plus, kwargs_minus = {}, {}
         for k, v in model_kwargs.items():
             if torch.is_tensor(v) and v.shape[0] == B:
@@ -165,20 +208,21 @@ class SILoss:
                 kwargs_plus[k] = v
                 kwargs_minus[k] = v
 
-        # preserve RNG determinism
         if rng_state is None:
             rng_state = torch.cuda.get_rng_state()
 
         torch.cuda.set_rng_state(rng_state)
-        f_plus = model(x_plus, r, t_plus, **kwargs_plus)
+        # <-- MODIFIED: Pass cls_token and get 3 outputs
+        f_plus, _, _ = model(x_plus, r, t_plus, **kwargs_plus, cls_token=cls_input_plus)
 
         torch.cuda.set_rng_state(rng_state)
-        f_minus = model(x_minus, r, t_minus, **kwargs_minus)
+        # <-- MODIFIED: Pass cls_token and get 3 outputs
+        f_minus, _, _ = model(x_minus, r, t_minus, **kwargs_minus, cls_token=cls_input_minus)
 
         dF_dv_dt = (f_plus - f_minus) / (2 * eps)
         return dF_dv_dt
-
-    def __call__(self, model, images, model_kwargs=None):
+    
+    def __call__(self, model, images, model_kwargs=None, zs=None, cls_token=None):
         """
         Compute MeanFlow loss function with bootstrap mechanism
         """
@@ -209,18 +253,35 @@ class SILoss:
         r, t = self.sample_time_steps(batch_size, device)
 
         noises = torch.randn_like(images)
-        
+        noises_cls = torch.randn_like(cls_token) if cls_token is not None else None
+
         # Calculate interpolation and z_t
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(t.view(-1, 1, 1, 1))
         z_t = alpha_t * images + sigma_t * noises #(1-t) * images + t * noise
         
+        # <-- MODIFIED: Calculate noisy cls_input for REG
+        cls_input = None
+        if cls_token is not None:
+            alpha_t_cls = alpha_t.squeeze().unsqueeze(-1)
+            sigma_t_cls = sigma_t.squeeze().unsqueeze(-1)
+            cls_input = alpha_t_cls * cls_token + sigma_t_cls * noises_cls
+
         # Calculate instantaneous velocity v_t 
         v_t = d_alpha_t * images + d_sigma_t * noises
+
+        # <-- MODIFIED: Calculate cls_target for REG
+        cls_target = None
+        if cls_token is not None:
+            d_alpha_t_cls = d_alpha_t.squeeze().unsqueeze(-1)
+            d_sigma_t_cls = d_sigma_t.squeeze().unsqueeze(-1)
+            cls_target = d_alpha_t_cls * cls_token + d_sigma_t_cls * noises_cls
+
         time_diff = (t - r).view(-1, 1, 1, 1)
                 
-        u_target = torch.zeros_like(v_t)
+        # u_target = torch.zeros_like(v_t)
         
-        u = model(z_t, r, t, **model_kwargs)
+        # u = model(z_t, r, t, **model_kwargs)
+        u, zs_tilde, cls_output = model(z_t, r, t, **model_kwargs, cls_token=cls_input)  # <-- MODIFIED: Get 3 outputs
         
         
         # Check if CFG should be applied (exclude unconditional samples)
@@ -263,8 +324,19 @@ class SILoss:
                 cfg_combined_kwargs = cfg_kwargs.copy()
                 cfg_combined_kwargs['y'] = cfg_y_batch
 
+                cfg_cls_input_at_t = cls_input[cfg_indices] if cls_input is not None else None
+                cfg_cls_input_batch = None
+                if cfg_cls_input_at_t is not None:
+                    cfg_cls_input_batch = torch.cat([cfg_cls_input_at_t, cfg_cls_input_at_t], dim=0)
+
                 with torch.no_grad():
-                    cfg_combined_u_at_t = model(cfg_z_t_batch, cfg_r_batch, cfg_t_batch, **cfg_combined_kwargs)
+                    cfg_combined_u_at_t, _, _ = model(
+                        cfg_z_t_batch, 
+                        cfg_r_batch, 
+                        cfg_t_batch, 
+                        **cfg_combined_kwargs,
+                        cls_token=cfg_cls_input_batch # <-- Pass batched token
+                    )
                     cfg_u_cond_at_t, cfg_u_uncond_at_t = torch.chunk(cfg_combined_u_at_t, 2, dim=0)
                     cfg_v_tilde = (self.cfg_omega * cfg_v_t + 
                                    self.cfg_kappa * cfg_u_cond_at_t + 
@@ -278,6 +350,8 @@ class SILoss:
                     cfg_t,                 # t
                     cfg_r,                 # r
                     cfg_kwargs,
+                    cls_token[cfg_indices] if cls_token is not None else None,
+                    noises_cls[cfg_indices] if noises_cls is not None else None,
                     rng_state=rng_state
                 )
                 
@@ -307,6 +381,8 @@ class SILoss:
                     no_cfg_t,
                     no_cfg_r,
                     no_cfg_kwargs,
+                    cls_token[no_cfg_indices] if cls_token is not None else None,
+                    noises_cls[no_cfg_indices] if noises_cls is not None else None,
                     rng_state=rng_state
                 )
 
@@ -316,14 +392,16 @@ class SILoss:
         else:
             # No labels or no CFG applicable samples, use standard DDE
             
-            # CHANGED: Compute JVP for all samples using DDE
+            # <-- MODIFIED: Pass REG tokens to DDE
             dudt = self._dde_derivative(
                 model,
-                images,    # x (clean)
-                noises,    # z (noise)
-                t,         # t
-                r,         # r
+                images,      # x (clean)
+                noises,      # z (noise)
+                t,           # t
+                r,           # r
                 model_kwargs,
+                cls_token,
+                noises_cls,
                 rng_state=rng_state
             )
 
@@ -340,4 +418,25 @@ class SILoss:
         else:
             loss = loss_mid
         loss_mean_ref = torch.mean((error**2))
-        return loss, loss_mean_ref
+
+        proj_loss = torch.tensor(0.0, device=device)
+        if zs is not None and zs_tilde is not None:
+            proj_loss_val = 0.
+            bsz = zs[0].shape[0]
+            for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)): # Loop over encoders
+                z_norm = F.normalize(z.detach(), dim=-1) # (B, T, D)
+                z_tilde_norm = F.normalize(z_tilde, dim=-1) # (B, T, D)
+                
+                # Negative cosine similarity, averaged over tokens and summed over batch
+                neg_cos_sim = -torch.sum(z_norm * z_tilde_norm, dim=-1)
+                proj_loss_per_item = torch.mean(neg_cos_sim, dim=1) # (B,)
+                proj_loss_val += torch.sum(proj_loss_per_item) # Sum over batch
+                
+            if len(zs) > 0:
+                proj_loss = proj_loss_val / (len(zs) * bsz) # Mean over encoders and batch
+
+        denoising_loss_cls = torch.tensor(0.0, device=device)
+        if cls_output is not None and cls_target is not None:
+            denoising_loss_cls = mean_flat((cls_output - cls_target.detach()) ** 2)
+            
+        return loss, loss_mean_ref, proj_loss, denoising_loss_cls

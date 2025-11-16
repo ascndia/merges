@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -27,10 +28,9 @@ from dataset import CustomDataset
 from diffusers.models import AutoencoderKL
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from train_handlers import SampleHandler, MeanFlowSampler, CheckpointHandler
-import math
+from utils import load_encoders, preprocess_raw_image
 
 logger = get_logger(__name__)
-
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -122,10 +122,18 @@ def main(args):
     else:
         input_size = args.resolution  # For MNIST, no VAE, so latent size = image size
     
+    if args.enc_type != None:
+        encoders, encoder_types, architectures = load_encoders(
+            args.enc_type, device, args.resolution
+            )
+    else:
+        raise NotImplementedError()
+    z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
+    
     # Define block_kwargs from args
     block_kwargs = {
-        "fused_attn": True,
-        "qk_norm": False,
+        "fused_attn": args.fused_attn,
+        "qk_norm": args.qk_norm,
     }
 
     model = SiT_models[args.model](
@@ -240,24 +248,52 @@ def main(args):
         ).view(1, 4, 1, 1).to(device)
     for epoch in range(args.epochs):
         model.train()
-        for _, moments, labels in train_dataloader:
-            moments = moments.to(device, non_blocking=True)
+        for raw_image, vae_moments, labels in train_dataloader:
+            raw_image = raw_image.to(device, non_blocking=True)
+            vae_moments = vae_moments.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
             with torch.no_grad():
-                posterior = DiagonalGaussianDistribution(moments)
+                posterior = DiagonalGaussianDistribution(vae_moments)
                 x = posterior.sample()
                 x = x * latents_scale + latents_bias
             
+            with torch.no_grad():
+                zs = []
+                with accelerator.autocast():
+                    for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
+                        raw_image_ = preprocess_raw_image(raw_image, encoder_type)
+                        z = encoder.forward_features(raw_image_)
+                        
+                        if 'dinov2' in encoder_type:
+                            dense_z = z['x_norm_patchtokens']
+                            cls_token = z['x_norm_clstoken']
+                            dense_z = torch.cat([cls_token.unsqueeze(1), dense_z], dim=1)
+                        else:
+                            # Handle other encoder types if needed, or raise an error
+                            raise NotImplementedError(f"Encoder type {encoder_type} not supported in training loop")
+                        
+                        zs.append(dense_z)
+
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
-                loss, loss_ref = loss_fn(model, x, model_kwargs)
-                loss_mean = loss.mean()
-                loss_mean_ref = loss_ref.mean()
-                loss = loss_mean                
-        
+                loss, loss_ref, proj_loss_val, cls_loss_val = loss_fn(
+                    model, 
+                    x, 
+                    model_kwargs, 
+                    zs=zs,
+                    cls_token=cls_token
+                )
+                
+                loss_mean = loss.mean()             # Main MeanFlow loss
+                loss_mean_ref = loss_ref.mean()     # Main loss (for logging)
+                proj_loss_mean = proj_loss_val.mean() * args.proj_coeff # REPA loss
+                cls_loss_mean = cls_loss_val.mean() * args.cls          # REG loss            
+
+                total_loss = loss_mean + proj_loss_mean + cls_loss_mean
+            
                 ## optimization
-                accelerator.backward(loss)
+                accelerator.backward(total_loss)
                 grad_norm = torch.tensor(0.0, device=device)  # Initialize as tensor
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
@@ -276,9 +312,11 @@ def main(args):
                     checkpoint_handler.handle(global_step)
             
             logs = {
-                "loss": accelerator.gather(loss_mean).mean().detach().item(), 
-                "loss_ref": accelerator.gather(loss_mean_ref).mean().detach().item(), 
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()  # Now works since grad_norm is a tensor
+                "loss_total": accelerator.gather(total_loss).mean().item(),
+                "loss_main": accelerator.gather(loss_mean_ref).mean().item(),
+                "loss_repa": accelerator.gather(proj_loss_mean).mean().item(),
+                "loss_reg": accelerator.gather(cls_loss_mean).mean().item(),
+                "grad_norm": accelerator.gather(grad_norm).mean().item()
             }
             progress_bar.set_postfix(**logs)
             
@@ -314,6 +352,9 @@ def parse_args(input_args=None):
     # model
     parser.add_argument("--model", type=str, default="SiT-B/2")
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--encoder-depth", type=int, default=8)
+    parser.add_argument("--fused-attn", type=bool, default=True)
+    parser.add_argument("--qk-norm", type=bool, default=False)
 
     # dataset
     parser.add_argument("--dataset", type=str, choices=["custom", "mnist"], default="custom")
@@ -357,7 +398,11 @@ def parse_args(input_args=None):
     parser.add_argument("--cfg-kappa", type=float, default=0.0)
     parser.add_argument("--cfg-min-t", type=float, default=0.0)
     parser.add_argument("--cfg-max-t", type=float, default=0.8)
-    parser.add_argument("--differential-epsilon", type=float, default=0.005) 
+    parser.add_argument("--differential-epsilon", type=float, default=0.005)
+    # REPA and REG loss
+    parser.add_argument("--enc-type", type=str, default='dinov2-vit-b') # REPA
+    parser.add_argument("--proj-coeff", type=float, default=0.5) # REPA
+    parser.add_argument("--cls", type=float, default=0.03) # REG
     
     if input_args is not None:
         args = parser.parse_args(input_args)

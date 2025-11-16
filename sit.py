@@ -12,6 +12,15 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
+def build_mlp(hidden_size, projector_dim, z_dim):
+    return nn.Sequential(
+    nn.Linear(hidden_size, projector_dim),
+    nn.SiLU(),
+    nn.Linear(projector_dim, projector_dim),
+    nn.SiLU(),
+    nn.Linear(projector_dim, z_dim),
+)
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -114,21 +123,29 @@ class FinalLayer(nn.Module):
     """
     The final layer of SiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, cls_token_dim=None):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.linear_cls = nn.Linear(hidden_size, cls_token_dim, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, cls=None):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-
-        return x
+        if cls is None: # <-- MODIFIED
+            # This is the REPA-only or standard path
+            # Assume x has a dummy token at x[:, 0] that we ignore
+            x = self.linear(x[:, 1:]) # <-- MODIFIED: ignore first token
+            return x, None # <-- MODIFIED
+        else:
+            # This is the REG path, split output
+            cls_token_out = self.linear_cls(x[:, 0])  # (N, D_cls_out) <-- MODIFIED
+            x_out = self.linear(x[:, 1:])            # (N, T_patch, D_patch_out) <-- MODIFIED
+            return x_out, cls_token_out
 
 
 class SiT(nn.Module):
@@ -143,6 +160,7 @@ class SiT(nn.Module):
         in_channels=4,
         hidden_size=1152,
         decoder_hidden_size=768,
+        encoder_depth=8,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
@@ -151,6 +169,7 @@ class SiT(nn.Module):
         use_cfg=False,
         z_dims=[768],
         projector_dim=2048,
+        cls_token_dim=768,
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -162,7 +181,8 @@ class SiT(nn.Module):
         self.use_cfg = use_cfg
         self.num_classes = num_classes
         self.z_dims = z_dims
-
+        self.encoder_depth = encoder_depth
+        
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
             )
@@ -176,7 +196,18 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels)
+
+        self.projectors = nn.ModuleList([
+            build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
+        ])
+        
+        if cls_token_dim is None: # Default to first z_dim if not provided
+            cls_token_dim = self.z_dims[0]
+
+        self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels, cls_token_dim=cls_token_dim)
+        self.cls_projectors2 = nn.Linear(in_features=cls_token_dim, out_features=hidden_size, bias=True)
+        self.wg_norm = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -190,7 +221,8 @@ class SiT(nn.Module):
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5)
+            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5),
+            cls_token=True, extra_tokens=1
             )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -217,6 +249,8 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        nn.init.constant_(self.final_layer.linear_cls.weight, 0) 
+        nn.init.constant_(self.final_layer.linear_cls.bias, 0)
 
     def unpatchify(self, x, patch_size=None):
         """
@@ -233,7 +267,7 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
     
-    def forward(self, x, r, t, y=None, return_logvar=False):
+    def forward(self, x, r, t, y=None, return_logvar=False, cls_token=None):
         """
         Forward pass of SiT modified for MeanFlow.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -241,8 +275,23 @@ class SiT(nn.Module):
         t: (N,) tensor of end timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x) # (N, T, D), where T = H * W / patch_size ** 2
         N, T, D = x.shape
+
+        if cls_token is not None:
+            # REG path: Project and prepend the provided class token
+             cls_token_embed = self.cls_projectors2(cls_token) # (N, D_hidden)
+             cls_token_embed = self.wg_norm(cls_token_embed)  # (N, D_hidden)
+             cls_token_embed = cls_token_embed.unsqueeze(1)    # (N, 1, D_hidden)
+             x = torch.cat((cls_token_embed, x), dim=1)        # (N, T_patch + 1, D_hidden)
+        else:
+            # REPA-only path: Prepend a dummy zero token to match pos_embed dimensions
+             dummy_token = torch.zeros(N, 1, D, device=x.device, dtype=x.dtype)
+             x = torch.cat((dummy_token, x), dim=1) # (N, T_patch + 1, D_hidden)
+             
+        x = x + self.pos_embed  # Add positional embedding (size is 1, T_patch + 1, D_hidden)
+        N_full, T_full, D_full = x.shape
+
         # Timestep and class embedding - modified for MeanFlow with r and t
         t_embed = self.t_embedder(t)   # (N, D)
         r_embed = self.r_embedder(t-r)   # (N, D)
@@ -254,12 +303,16 @@ class SiT(nn.Module):
         y_embed = self.y_embedder(y, self.training)  # (N, D)
         c = t_embed + r_embed + y_embed  # (N, D)
 
+        zs = [] 
         for i, block in enumerate(self.blocks):
-            x = block(x, c)  # (N, T, D)
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
+            x = block(x, c) # (N, T_full, D)
+            if (i + 1) == self.encoder_depth:
+                zs = [proj(x) for proj in self.projectors]
 
-        return x
+        x_out, cls_token_out = self.final_layer(x, c, cls=(cls_token is not None))
+        x = self.unpatchify(x) 
+
+        return x_out, zs, cls_token_out
 
 
 #################################################################################
