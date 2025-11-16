@@ -272,9 +272,10 @@ class SILoss:
         # <-- MODIFIED: Calculate cls_target for REG
         cls_target = None
         if cls_token is not None:
-            d_alpha_t_cls = d_alpha_t.squeeze().unsqueeze(-1)
-            d_sigma_t_cls = d_sigma_t.squeeze().unsqueeze(-1)
-            cls_target = d_alpha_t_cls * cls_token + d_sigma_t_cls * noises_cls
+            # d_alpha_t_cls = d_alpha_t.squeeze().unsqueeze(-1)
+            # d_sigma_t_cls = d_sigma_t.squeeze().unsqueeze(-1)
+            # cls_target = d_alpha_t_cls * cls_token + d_sigma_t_cls * noises_cls
+            cls_target = d_alpha_t * cls_token + d_sigma_t * noises_cls
 
         time_diff = (t - r).view(-1, 1, 1, 1)
                 

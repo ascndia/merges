@@ -85,6 +85,7 @@ def main(args):
     
     save_dir = os.path.join(args.output_dir, f"{args.exp_name}-batch-size{args.batch_size * args.gradient_accumulation_steps}")
     sample_dir = f"{save_dir}/samples"  # Stores sampled outputs
+    checkpoint_dir = f"{save_dir}/checkpoints"  # Stores saved model checkpoints
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -94,7 +95,6 @@ def main(args):
         json_dir = os.path.join(save_dir, "args.json")
         with open(json_dir, 'w') as f:
             json.dump(args_dict, f, indent=4)
-        checkpoint_dir = f"{save_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(sample_dir, exist_ok=True)
         logger = create_logger(save_dir)
