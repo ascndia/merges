@@ -309,7 +309,7 @@ class SiT(nn.Module):
                 zs = [proj(x) for proj in self.projectors]
 
         x_out, cls_token_out = self.final_layer(x, c, cls=(cls_token is not None))
-        x = self.unpatchify(x) 
+        x_out = self.unpatchify(x_out) # <-- PERBAIKAN: Gunakan x_out
 
         return x_out, zs, cls_token_out
 
